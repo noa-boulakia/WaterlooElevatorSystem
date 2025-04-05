@@ -1,0 +1,593 @@
+/*
+Author: Noa Boulakia & Leora Singer
+Date: March 27, 2025
+Purpose:
+To make a dual elevator system that works on a custom millis function and both elevators run independently! All movements are logged.
+
+*/
+#include "pitches.h"
+#include <avr/interrupt.h> // REQUIRED for ISR, cli(), sei()
+#include <stdio.h>          // Required for sprintf
+
+// ========================== PIN CONFIG ==========================
+#define SPEAKER_PIN 9
+#define BUTTONS_ANALOG_PIN A0
+
+// Elevator 1 pins
+int elevator1_downLED = 10;
+int elevator1_upLED = 11;
+int elevator1_white1 = 12; // LSB
+int elevator1_white2 = 13; // MSB
+
+// Elevator 2 pins
+int elevator2_downLED = 5;
+int elevator2_upLED = 6;
+int elevator2_white1 = 8; // LSB
+int elevator2_white2 = 7; // MSB
+
+// ========================== STRUCTS ============================
+struct Elevator {
+  int currentFloor;
+  bool doorClosed;
+  bool isMoving;
+  unsigned long moveStartTime;
+  int targetFloor;
+  int startFloor;
+  unsigned long floorArrivalTime;       // Time when elevator arrived at the current floor
+  unsigned long doorCloseRequestTime; // Time when door close button was pressed
+};
+
+// ========================== GLOBALS ============================
+int emergencyLED = 4;
+unsigned long systemStartTime;          // Track when the system (re)started
+unsigned long lastEmergencyTime = 0;    // Used for calculating time between emergencies
+unsigned long emergencyStartTime = 0;   // Track when the current emergency started
+bool emergencyState = false;            
+int emergencyCount = 0;                 // Count total emergencies
+volatile bool emergencyTriggered = false;// Flag set by ISR logic for emergency button
+volatile bool buttonISRTriggered = false;// Flag set by button ISR
+unsigned long debounceStartTime = 0;     // Time ISR was triggered, for debouncing
+const unsigned long debounceDelay = 50;  // Debounce time in ms
+
+Elevator elevator1;
+Elevator elevator2;
+
+volatile unsigned long timer1_millis_counter = 0; // Counter for custom millis
+
+// --- Sound Globals ---
+bool melodyPlaying = false; 
+unsigned long lastToneTime = 0;
+unsigned long lastEmergencyBeepTime = 0;
+bool emergencyBeepOn = false;
+int noteIndex = 0;
+
+// --- Button Globals ---
+int detectedButton = -1; // 0–8 for buttons, -1 = none
+
+//==================== Song! ===========================
+int jeopardyNotes[] = {
+  NOTE_C2, NOTE_F3, NOTE_C3, NOTE_A2,
+  NOTE_C3, NOTE_F3, NOTE_C3,
+  NOTE_C3, NOTE_F3, NOTE_C3, NOTE_F3,
+  NOTE_AS3, NOTE_G3, NOTE_F3, NOTE_E3, NOTE_D3, NOTE_CS3,
+  NOTE_C3, NOTE_F3, NOTE_C3, NOTE_A2,
+  NOTE_C3, NOTE_F3, NOTE_C3,
+  NOTE_AS3, 0, NOTE_G3, NOTE_F3,
+  NOTE_E3, NOTE_D3, NOTE_CS3, NOTE_C3
+};
+int noteDurations[] = { // quarter notes (4) and eighth notes (8)! As a music nerd, I love this part
+  4, 4, 4, 4,
+  4, 4, 2,
+  4, 4, 4, 4,
+  3, 8, 8, 8, 8, 8,
+  4, 4, 4, 4,
+  4, 4, 2,
+  4, 8, 8, 4, 4,
+  4, 4, 4, 4,
+  0 // Terminator for duration array
+};
+const int numNotes = sizeof(jeopardyNotes) / sizeof(jeopardyNotes[0]);
+
+
+// ======================= FUNCTION DECLARATIONS ==================
+unsigned long custom_millis();
+void logEvent(int elevator, const char* event, int floor = -1); 
+void buttonISR();
+int getButtonFromAnalog(int value);
+void handleButtonInput(int button);
+void startElevatorMove(Elevator ,&e, int destination, int elevatorNum);
+void updateElevator(Elevator &e, int elevatorNum);
+void updateFloorLEDs(Elevator &e); // Passing by reference (updating a global variable which is accessabile anywhere) 
+void playJeopardyIfNeeded();
+void playEmergencyBeep();
+
+// ======================== TIMER1 FOR custom_millis() ===========
+// Timer1 Compare Match A Interrupt Vector
+ISR(TIMER1_COMPA_vect) {
+  timer1_millis_counter++;
+}
+
+unsigned long custom_millis() {
+  unsigned long m;
+  uint8_t oldSREG = SREG; // Save status register (including interrupt enable flag)
+  cli(); // Disable global interrupts
+  m = timer1_millis_counter; // Read OUR Timer1 counter variable
+  SREG = oldSREG; 
+  return m;
+}
+
+
+// ========================== SETUP ===============================
+void setup() {
+  // --- Timer1 Configuration for custom_millis() ---
+  cli(); // Disable interrupts during setup
+  TCCR1A = 0; // Clear Timer1 control registers
+  TCCR1B = 0;
+  TCNT1  = 0; // Reset counter to 0
+  OCR1A = 249;
+  // Set CTC Mode (WGM12 bit in TCCR1B)
+  TCCR1B |= (1 << WGM12);
+  // Set Prescaler to 64 (CS11 and CS10 bits in TCCR1B)
+  TCCR1B |= (1 << CS11) | (1 << CS10);
+  // Enable Timer1 Compare A Match Interrupt (OCIE1A bit in TIMSK1)
+  TIMSK1 |= (1 << OCIE1A);
+  // NOTE to future Noa self: custom_millis() relies on timer1_millis_counter being incremented by the ISR
+  // Reading systemStartTime after enabling interrupts.
+
+  // Initialize Serial communication
+  Serial.begin(9600);
+  while (!Serial); // Wait for Serial port to connect
+
+  sei(); // Re-enable global interrupts NOW so custom_millis() works
+
+  // Record system start time after timer and serial are ready
+  systemStartTime = custom_millis(); // Get the time from our custom timer! Woot woot
+  // Initial Log Event
+  char startBuffer[100];
+  sprintf(startBuffer, "System Initialized. Total runtime tracking started.");
+  logEvent(0, startBuffer, -1); // Elevator 0 = System Event
+
+  // Attach button interrupt (Pin 2)
+  attachInterrupt(digitalPinToInterrupt(2), buttonISR, RISING);
+
+  // Pin Modes
+  pinMode(SPEAKER_PIN, OUTPUT);
+  pinMode(emergencyLED, OUTPUT);
+  digitalWrite(emergencyLED, LOW);
+
+  pinMode(elevator1_upLED, OUTPUT);
+  pinMode(elevator1_downLED, OUTPUT);
+  pinMode(elevator1_white1, OUTPUT);
+  pinMode(elevator1_white2, OUTPUT);
+
+  pinMode(elevator2_upLED, OUTPUT);
+  pinMode(elevator2_downLED, OUTPUT);
+  pinMode(elevator2_white1, OUTPUT);
+  pinMode(elevator2_white2, OUTPUT);
+
+  // Initialize elevator states
+  elevator1.currentFloor = 1;
+  elevator1.doorClosed = true; 
+  elevator1.isMoving = false;
+  elevator1.targetFloor = 1;
+  elevator1.startFloor = 1;
+  elevator1.floorArrivalTime = custom_millis(); // Arrived at floor 1 at startup
+  elevator1.doorCloseRequestTime = 0; // No request yet
+
+  elevator2.currentFloor = 1;
+  elevator2.doorClosed = true; // Start closed
+  elevator2.isMoving = false;
+  elevator2.targetFloor = 1;
+  elevator2.startFloor = 1;
+  elevator2.floorArrivalTime = custom_millis(); // Arrived at floor 1 at startup
+  elevator2.doorCloseRequestTime = 0; // No request yet
+
+  updateFloorLEDs(elevator1);
+  updateFloorLEDs(elevator2);
+
+  logEvent(1, "Initialized at Floor 1, Door Closed", 1);
+  logEvent(2, "Initialized at Floor 1, Door Closed", 1);
+
+  Serial.println("--- Setup Complete ---"); // Use Serial.println for simple messages
+}
+
+// ====================== MAIN LOOP ==============================
+void loop() {
+  unsigned long currentMillis = custom_millis(); // Get time once per loop
+
+  // Sound Management
+  if (emergencyTriggered) {
+    playEmergencyBeep();
+  } else {
+    // Stop jeopardy if it was playing and emergency was just cleared
+    if (emergencyBeepOn) { // If beep was on, it means emergency was active
+        noTone(SPEAKER_PIN);
+        emergencyBeepOn = false; // Ensure beep state is reset
+        noteIndex = 0; // Reset music index
+    }
+    playJeopardyIfNeeded();
+  }
+
+  // Handle button press detected by ISR (debounced)
+  if (buttonISRTriggered) {
+    if (currentMillis - debounceStartTime >= debounceDelay) { // Use >= for safety
+      int analogValue = analogRead(BUTTONS_ANALOG_PIN); // Read analog value ONLY here
+      detectedButton = getButtonFromAnalog(analogValue);
+
+      handleButtonInput(detectedButton); // Process the detected button
+
+      buttonISRTriggered = false; // Reset flag after handling
+      detectedButton = -1; // Reset detected button
+    }
+    // If not enough time passed, flag remains true, check again next loop
+  }
+
+  // Update elevator states
+  updateElevator(elevator1, 1); // Pass elevator number
+  updateElevator(elevator2, 2); // Pass elevator number
+}
+
+// ============= JEOPARDY PLAYER ====================
+void playJeopardyIfNeeded() {
+  // Play only if at least one elevator is moving AND emergency is NOT active
+  if ((elevator1.isMoving || elevator2.isMoving) && !emergencyTriggered) {
+    int durationMillis = 2000 / noteDurations[noteIndex]; // Calculate duration in ms
+
+    if (custom_millis() - lastToneTime > durationMillis) {
+      int note = jeopardyNotes[noteIndex];
+      noTone(SPEAKER_PIN);
+
+      if (note > 0) {
+          // Play the note for slightly less than full duration to create separation
+          tone(SPEAKER_PIN, note, durationMillis * 0.9);
+      } // If note is 0 (rest), noTone() was already called
+
+      lastToneTime = custom_millis();
+      noteIndex++;
+
+      // Check bounds carefully, loop back to start if end reached or rest duration marker (0) found
+      if (noteIndex >= numNotes || noteDurations[noteIndex] == 0) {
+        noteIndex = 0;
+      }
+    }
+  } else {
+    // Ensure tone is stopped if no elevator is moving or if emergency is active
+    if (!emergencyTriggered) { // Only stop if not in emergency (emergency handles its own sound)
+        noTone(SPEAKER_PIN);
+        noteIndex = 0; // Reset music index when elevators stop normally
+    }
+  }
+}
+
+// ============ EMERGENCY BEEP PLAYER =================
+void playEmergencyBeep() {
+  // Only beep if emergency is triggered
+  if (!emergencyTriggered) {
+    if (emergencyBeepOn) { // If beep was on, ensure it's turned off
+        noTone(SPEAKER_PIN);
+        emergencyBeepOn = false;
+    }
+    return;
+  }
+
+  unsigned long now = custom_millis();
+  unsigned long interval = 300; // Beep interval (ms)
+
+  if (emergencyBeepOn && now - lastEmergencyBeepTime >= interval) {
+    noTone(SPEAKER_PIN);
+    emergencyBeepOn = false;
+    lastEmergencyBeepTime = now;
+  } else if (!emergencyBeepOn && now - lastEmergencyBeepTime >= interval) {
+    tone(SPEAKER_PIN, NOTE_C5, interval / 2); // Beep at C5 for half the interval
+    emergencyBeepOn = true;
+    lastEmergencyBeepTime = now;
+  }
+}
+
+// ============== BUTTON ANALOG VALUE MAPPER =======================
+// Adjusted ranges slightly for potential analog drift
+int getButtonFromAnalog(int value) {
+  if (value >= 905 && value <= 935) return 8; // Emergency
+  else if (value >= 825 && value <= 845) return 4; // E2 Close
+  else if (value >= 852 && value <= 872) return 5; // E2 Floor 1
+  else if (value >= 870 && value <= 890) return 6; // E2 Floor 2
+  else if (value >= 895 && value <= 915) return 7; // E2 Floor 3
+  else if (value >= 700 && value <= 720) return 0; // E1 Close
+  else if (value >= 728 && value <= 748) return 1; // E1 Floor 1
+  else if (value >= 759 && value <= 779) return 2; // E1 Floor 2
+  else if (value >= 792 && value <= 812) return 3; // E1 Floor 3
+  else return -1; // No button detected
+}
+
+// ============== ISR FOR BUTTON PRESS DETECTION =================
+void buttonISR() {
+  if (!buttonISRTriggered) {
+     debounceStartTime = custom_millis(); // Record time for debounce check in loop
+     buttonISRTriggered = true;
+  }
+}
+
+// ============== MAIN BUTTON HANDLING LOGIC ======================
+void handleButtonInput(int button) {
+  if (button == -1) return; // No valid button pressed
+
+  unsigned long now = custom_millis();
+  char logBuffer[128]; // Buffer for formatting log messages
+
+  // --- Handle Emergency Button (Button 8) ---
+  if (button == 8) {
+    if (!emergencyTriggered) {
+      // ---- TRIGGER EMERGENCY ----
+      emergencyTriggered = true;
+      emergencyStartTime = now; // Record start time of this emergency
+      emergencyCount++;         // Increment total count
+      digitalWrite(emergencyLED, HIGH);
+
+      // Calculate time between last emergency end (or system start) and this one
+      unsigned long timeSinceLastEmergency = 0;
+      if (lastEmergencyTime > 0) { // If there was a previous emergency
+          timeSinceLastEmergency = now - lastEmergencyTime;
+      } else { // First emergency since boot
+          timeSinceLastEmergency = now - systemStartTime;
+      }
+
+      // Calculate response time (ISR trigger to handling)
+      unsigned long responseTime = now - debounceStartTime;
+
+      sprintf(logBuffer, "EMERGENCY START (Count: %d, Response Time: %lu s, Time Since Last: %lu s)",
+              emergencyCount, responseTime/1000, timeSinceLastEmergency/1000);
+      logEvent(0, logBuffer, -1); // Log system event
+
+      // Optional: Stop elevators immediately
+      if (elevator1.isMoving) {
+          elevator1.isMoving = false;
+          digitalWrite(elevator1_upLED, LOW);
+          digitalWrite(elevator1_downLED, LOW);
+          logEvent(1, "Movement stopped due to emergency", elevator1.currentFloor); // Log floor it stopped at
+      }
+       if (elevator2.isMoving) {
+          elevator2.isMoving = false;
+          digitalWrite(elevator2_upLED, LOW);
+          digitalWrite(elevator2_downLED, LOW);
+          logEvent(2, "Movement stopped due to emergency", elevator2.currentFloor);
+      }
+      noTone(SPEAKER_PIN); // Stop jeopardy music immediately
+      noteIndex = 0; // Reset music index
+      playEmergencyBeep(); // Start emergency beep immediately
+
+    } else {
+      // ---- CLEAR EMERGENCY ----
+      emergencyTriggered = false;
+      digitalWrite(emergencyLED, LOW);
+      lastEmergencyTime = now; // Record when this emergency ended
+      unsigned long emergencyDuration = now - emergencyStartTime;
+
+      sprintf(logBuffer, "EMERGENCY CLEARED (Duration: %lu s)", emergencyDuration/1000);
+      logEvent(0, logBuffer, -1); // Log system event
+
+      noTone(SPEAKER_PIN); // Ensure beep stops
+      emergencyBeepOn = false; // Reset beep state machine
+      // Elevators remain stopped, require new button press to move.
+    }
+    return; // Exit after handling emergency button
+  }
+
+  // --- Ignore other buttons if emergency is active ---
+  if (emergencyTriggered) {
+     logEvent(0, "Button ignored, emergency active", -1);
+     return;
+  }
+
+  // --- Elevator 1 Controls (Buttons 0-3) ---
+  if (button >= 0 && button <= 3) {
+    int elevatorNum = 1;
+    Elevator &e = elevator1; // Use reference for convenience
+
+    if (button == 0) { // E1 Close Door
+      if (!e.doorClosed) {
+        e.doorCloseRequestTime = now; // Record time button was pressed
+        e.doorClosed = true;
+        // Calculate time from button press to door state change (instantaneous here)
+        unsigned long closeDuration = now - e.doorCloseRequestTime; // Will be very small (basically 0)
+        sprintf(logBuffer, "Door Close command received (Request took %lu s)", closeDuration/100);
+        logEvent(elevatorNum, logBuffer, e.currentFloor);
+      } else {
+        logEvent(elevatorNum, "Door Close requested but already closed", e.currentFloor);
+      }
+    } else { // E1 Floor Buttons (1, 2, 3)
+      int targetFloor = button; // Button 1 -> Floor 1, etc.
+      if (e.doorClosed) {
+        if (!e.isMoving) {
+          if (targetFloor != e.currentFloor) {
+              // Log floor request time relative to arrival time (time on floor before request)
+              unsigned long timeBeforeRequest = now - e.floorArrivalTime;
+              sprintf(logBuffer, "Request for floor %d (Time on current floor: %lu s)", targetFloor, timeBeforeRequest/1000);
+              logEvent(elevatorNum, logBuffer, e.currentFloor);
+              startElevatorMove(e, targetFloor, elevatorNum); // Start movement
+          } else {
+              logEvent(elevatorNum, "Request for current floor ignored", e.currentFloor);
+          }
+        } else {
+          logEvent(elevatorNum, "Request ignored, elevator already moving", e.currentFloor);
+        }
+      } else {
+        logEvent(elevatorNum, "Request ignored, door open", e.currentFloor);
+      }
+    }
+  }
+  // --- Elevator 2 Controls (Buttons 4-7) ---
+  else if (button >= 4 && button <= 7) {
+    int elevatorNum = 2;
+    Elevator &e = elevator2; // Use reference
+
+    if (button == 4) { // E2 Close Door
+      if (!e.doorClosed) {
+        e.doorCloseRequestTime = now;
+        e.doorClosed = true;
+        unsigned long closeDuration = now - e.doorCloseRequestTime;
+        sprintf(logBuffer, "Door Close command received (Request took %lu s)", closeDuration/1000);
+        logEvent(elevatorNum, logBuffer, e.currentFloor);
+      } else {
+         logEvent(elevatorNum, "Door Close requested but already closed", e.currentFloor);
+      }
+    } else { // E2 Floor Buttons (5, 6, 7)
+      int targetFloor = button - 4; // Button 5 -> Floor 1, etc.
+       if (e.doorClosed) {
+        if (!e.isMoving) {
+           if (targetFloor != e.currentFloor) {
+              unsigned long timeBeforeRequest = now - e.floorArrivalTime;
+              sprintf(logBuffer, "Request for floor %d (Time on current floor: %lu s)", targetFloor, timeBeforeRequest/1000);
+              logEvent(elevatorNum, logBuffer, e.currentFloor);
+              startElevatorMove(e, targetFloor, elevatorNum);
+           } else {
+               logEvent(elevatorNum, "Request for current floor ignored", e.currentFloor);
+           }
+        } else {
+          logEvent(elevatorNum, "Request ignored, elevator already moving", e.currentFloor);
+        }
+      } else {
+        logEvent(elevatorNum, "Request ignored, door open", e.currentFloor);
+      }
+    }
+  }
+}
+
+
+// ============== ELEVATOR MOVEMENT START ==========================
+void startElevatorMove(Elevator &e, int destination, int elevatorNum) {
+  if (e.isMoving || destination == e.currentFloor || destination < 1 || destination > 3 || !e.doorClosed || emergencyTriggered) {
+     logEvent(elevatorNum, "Invalid move request state", e.currentFloor);
+     return;
+  }
+
+  unsigned long now = custom_millis();
+  char logBuffer[128];
+
+  // --- Log Time Spent on Floor Before Departing ---
+  // floorArrivalTime is set on arrival (or system start)
+  unsigned long timeOnFloor = now - e.floorArrivalTime;
+  sprintf(logBuffer, "Departing floor %d (Time spent on floor: %lu s)", e.currentFloor, timeOnFloor/1000);
+  logEvent(elevatorNum, logBuffer, e.currentFloor);
+
+  // --- Set Up Movement ---
+  e.targetFloor = destination;
+  e.startFloor = e.currentFloor; // Record starting floor
+  e.isMoving = true;
+  e.moveStartTime = now; // Record the exact time movement *starts*
+
+  bool movingUp = (destination > e.startFloor);
+
+  // --- Log Start of Movement ---
+  sprintf(logBuffer, "Moving from %d to %d", e.startFloor, e.targetFloor);
+  logEvent(elevatorNum, logBuffer, -1); // Floor info is in the message
+
+  // Update LEDs
+  int upLedPin = (elevatorNum == 1) ? elevator1_upLED : elevator2_upLED;
+  int downLedPin = (elevatorNum == 1) ? elevator1_downLED : elevator2_downLED;
+  digitalWrite(upLedPin, movingUp);
+  digitalWrite(downLedPin, !movingUp);
+}
+
+// ============== ELEVATOR STATE UPDATE (PER LOOP) ===============
+void updateElevator(Elevator &e, int elevatorNum) {
+  if (!e.isMoving || emergencyTriggered) return; // Don't update if not moving or emergency
+
+  // Define travel times per floor distance
+  const unsigned long timePerFloor = 5000; // 5 seconds per floor
+  int distance = abs(e.targetFloor - e.startFloor); // Use startFloor for distance calculation
+  unsigned long travelTime = distance * timePerFloor;
+
+  unsigned long now = custom_millis();
+  char logBuffer[128];
+
+  // --- Check if Arrival Time Reached ---
+  if (now - e.moveStartTime >= travelTime) {
+    // --- Arrived at Target Floor ---
+    unsigned long actualTravelDuration = now - e.moveStartTime; // Calculate actual travel time
+
+    // Log Arrival with Travel Time
+    sprintf(logBuffer, "Arrived at floor %d (Travel Time: %lu s)", e.targetFloor, actualTravelDuration/1000);
+    logEvent(elevatorNum, logBuffer, e.targetFloor);
+
+    // Update Elevator State
+    e.currentFloor = e.targetFloor;
+    e.isMoving = false;
+    e.doorClosed = false; // Door opens upon arrival
+    e.floorArrivalTime = now; // Record the exact arrival time
+
+    // Turn off movement LEDs
+    int upLedPin = (elevatorNum == 1) ? elevator1_upLED : elevator2_upLED;
+    int downLedPin = (elevatorNum == 1) ? elevator1_downLED : elevator2_downLED;
+    digitalWrite(upLedPin, LOW);
+    digitalWrite(downLedPin, LOW);
+
+    // Update Floor Indicator LEDs
+    updateFloorLEDs(e);
+
+    // Log Door Opening
+    logEvent(elevatorNum, "Door Opened", e.currentFloor);
+
+    // Reset Jeopardy player if BOTH elevators stopped
+    if (!elevator1.isMoving && !elevator2.isMoving) {
+        noTone(SPEAKER_PIN);
+        noteIndex = 0;
+    }
+  }
+
+}
+
+// ==================== LOGGING FUNCTION ===========================
+void logEvent(int elevator, const char* event, int floor) {
+  // Get the current system time using custom_millis function
+  unsigned long now = custom_millis();
+
+  // Print timestamp in seconds with 3 decimal places for better resolution
+  Serial.print("Time: ");
+  Serial.print(now / 1000.0, 3); // Format as floating point seconds.milliseconds
+  Serial.print("s - ");
+
+  // Identify the source of the event
+  if (elevator == 1) {
+    Serial.print("Elevator 1: ");
+  } else if (elevator == 2) {
+    Serial.print("Elevator 2: ");
+  } else { // elevator == 0 or any other value treated as System
+    Serial.print("System: ");
+  }
+
+  // Print the main event description string
+  Serial.print(event);
+
+  // Print Floor information only if it's relevant (>= 0)
+  if (floor >= 0) { // Allows logging for floor 0 if it existed
+    Serial.print(" [Floor: ");
+    Serial.print(floor);
+    Serial.print("]");
+  }
+
+  Serial.println(); // End the log entry with a newline
+}
+
+// ============== FLOOR LED UPDATE ===============================
+// Updates the 2-bit binary display for the elevator's current floor.
+void updateFloorLEDs(Elevator &e) {
+  // Represent floor 1, 2, 3 using 2 bits (01, 10, 11)
+  byte floorBits = 0;
+  if (e.currentFloor == 1) floorBits = 0b01;      // 1
+  else if (e.currentFloor == 2) floorBits = 0b10; // 2
+  else if (e.currentFloor == 3) floorBits = 0b11; // 3
+
+  // Determine which pair of pins to use
+  int white1Pin, white2Pin;
+  if (&e == &elevator1) {
+    white1Pin = elevator1_white1; // LSB
+    white2Pin = elevator1_white2; // MSB
+  } else { // Must be elevator 2
+    white1Pin = elevator2_white1; // LSB
+    white2Pin = elevator2_white2; // MSB
+  }
+
+  // Set the LEDs based on the floor bits
+  digitalWrite(white1Pin, (floorBits >> 0) & 1); // Write LSB (bit 0)
+  digitalWrite(white2Pin, (floorBits >> 1) & 1); // Write MSB (bit 1)
+}
